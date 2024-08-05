@@ -10,99 +10,10 @@ import nltk
 import torch
 import numpy
 import time
-from bertopic import BERTopic
-from hdbscan import HDBSCAN
+# from bertopic import BERTopic
+# from hdbscan import HDBSCAN
+from db import connect_db, execute_sql, create_database
 nltk.download('punkt')
-
-def setup_database(db_path: str) -> None:
-    """
-    Set up the SQLite database and create tables if they do not exist.
-
-    Args:
-        db_path (str): The file path to the SQLite database.
-    """
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Create nlp_model table if it does not exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS nlp_model (
-            uuid TEXT PRIMARY KEY,
-            model TEXT NOT NULL,
-            label TEXT NOT NULL UNIQUE,
-            chunking_method TEXT CHECK(chunking_method IN ('sentence', 'word', 'char')) NOT NULL,
-            chunking_size INTEGER NOT NULL
-        );
-    """)
-
-    # Create embeddings table if it does not exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS embeddings (
-            model_uuid TEXT NOT NULL,
-            law_entry_uuid TEXT NOT NULL,
-            creation_time TEXT NOT NULL,
-            char_start INTEGER NOT NULL,
-            char_end INTEGER NOT NULL,
-            embedding BLOB NOT NULL,
-            FOREIGN KEY(model_uuid) REFERENCES nlp_model(uuid),
-            FOREIGN KEY(law_entry_uuid) REFERENCES law_entries(uuid)
-        );
-    """)
-
-    # SQL statement to create the labels table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS labels (
-            label_uuid TEXT UNIQUE,
-            label TEXT NOT NULL UNIQUE,
-            creation_time TEXT NOT NULL,
-            color TEXT DEFAULT 'blue',
-            is_user_label BOOLEAN NOT NULL DEFAULT 0,
-            bert_id INTEGER PRIMARY KEY AUTOINCREMENT
-        );
-    """)
-
-    # SQL statement to create the label_embeddings table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cluster_label_link (
-            label_uuid TEXT NOT NULL,
-            law_entry_uuid TEXT NOT NULL,
-            creation_time TEXT NOT NULL,
-            FOREIGN KEY(label_uuid) REFERENCES labels(label_uuid),
-            FOREIGN KEY(law_entry_uuid) REFERENCES law_entries(uuid)
-        );
-    """)
-
-    # SQL statement to create the label_embeddings table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS label_embeddings (
-            label_uuid TEXT NOT NULL,
-            law_entry_uuid TEXT NOT NULL,
-            creation_time TEXT NOT NULL,
-            char_start INTEGER NOT NULL,
-            char_end INTEGER NOT NULL,
-            embedding BLOB NOT NULL,
-            model_uuid TEXT NOT NULL,
-            FOREIGN KEY(label_uuid) REFERENCES labels(label_uuid),
-            FOREIGN KEY(law_entry_uuid) REFERENCES law_entries(uuid),
-            FOREIGN KEY(model_uuid) REFERENCES nlp_model(uuid)
-        );
-    """)
-
-    # Create user_label_texts table if it does not exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_label_texts (
-            label_uuid TEXT NOT NULL,
-            text_uuid TEXT NOT NULL,
-            creation_time TEXT NOT NULL,
-            char_start INTEGER NOT NULL,
-            char_end INTEGER NOT NULL,
-            FOREIGN KEY(label_uuid) REFERENCES labels(label_uuid),
-            FOREIGN KEY(text_uuid) REFERENCES law_entries(uuid)
-        );
-    """)
-
-    conn.commit()
-    conn.close()
 
 def get_user_labels(db_path: str) -> list:
     """
@@ -121,69 +32,84 @@ def get_user_labels(db_path: str) -> list:
     conn.close()
     return [label[0] for label in labels]
 
-def fetch_entries_with_user_labels(db_path: str) -> tuple:
+def fetch_entries_with_user_labels_and_embeddings_chunk(db_path: str, model_uuid: str, chunk_size: int, chunk_number: int) -> tuple:
     """
-    Fetch all entries from the law_entries table and their associated user labels and bert_label_ids from the database.
-    If an entry has no associated user label, it is marked with "" and bert_label_id is marked with -1.
+    Fetch a specific chunk of entries from the embeddings table in the database along with their user labels,
+    bert_label_ids, and embeddings, in a memory-efficient manner.
 
     Args:
         db_path (str): The path to the SQLite database.
+        model_uuid (str): The UUID of the model to match embeddings.
+        chunk_size (int): The size of each chunk to be fetched.
+        chunk_number (int): The specific chunk number to return.
 
     Returns:
-        tuple: Four lists, one containing the texts, one containing the user label names (or "" if none), 
-               one containing the uuids of the law entries, and one containing the associated bert_label_ids (or -1 if none).
+        tuple: A tuple containing a list of tuples for each entry in the specified chunk, where each entry tuple contains:
+               - text_segment (str): The text segment corresponding to the embedding's character positions.
+               - text_uuid (str): The UUID of the associated law entry.
+               - label (str): The user label name associated with the embedding or an empty string if none.
+               - bert_label_id (int): The associated bert_label_id or -1 if none.
+               - embedding (numpy.ndarray): The embedding blob converted to a NumPy array.
+               The second element of the tuple is the total number of chunks available.
+
+    Raises:
+        ValueError: If the requested chunk_number is out of range.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-
-    # Fetch all law entries
-    cursor.execute("SELECT uuid, text FROM law_entries")
-    entries = cursor.fetchall()
-    entries_dict = {uuid: text for uuid, text in entries}
-
-    # Fetch all user labels and bert_label_ids associated with texts
+    
     cursor.execute("""
-        SELECT text_uuid, label, COALESCE(bli.id, -1) as bert_label_id
-        FROM user_label_texts ult
-        INNER JOIN labels l ON ult.label_uuid = l.label_uuid AND l.is_user_label = 1
-        LEFT JOIN bert_label_id bli ON l.label_uuid = bli.label_uuid
-    """)
-    labels = cursor.fetchall()
+        SELECT
+            (SELECT COUNT(*)
+            FROM embeddings e
+            INNER JOIN text_label_link ult ON e.text_uuid = ult.text_uuid
+            WHERE e.model_uuid = ? AND (e.char_start <= ult.char_end AND e.char_end >= ult.char_start)
+            ) +
+            (SELECT COUNT(DISTINCT e.uuid)
+            FROM embeddings e
+            WHERE e.model_uuid = ? AND NOT EXISTS (
+                SELECT 1
+                FROM text_label_link ult
+                WHERE e.text_uuid = ult.text_uuid AND (e.char_start <= ult.char_end AND e.char_end >= ult.char_start)
+            )
+        ) AS total_count
+    """, (model_uuid, model_uuid))
+    total_entries = cursor.fetchone()[0]
+    total_chunks = (total_entries + chunk_size - 1) // chunk_size
+    
+    if chunk_number < 1 or chunk_number > total_chunks:
+        conn.close()
+        raise ValueError(f"Requested chunk number {chunk_number} is out of range. Total available chunks: {total_chunks}.")
 
-    # Create dictionaries to associate texts with their labels and bert_label_ids
-    labels_dict = {}
-    bert_label_ids_dict = {}
-    for text_uuid, label, bert_label_id in labels:
-        if text_uuid in labels_dict:
-            labels_dict[text_uuid].append(label)
-            bert_label_ids_dict[text_uuid].append(bert_label_id)
-        else:
-            labels_dict[text_uuid] = [label]
-            bert_label_ids_dict[text_uuid] = [bert_label_id]
+    offset = (chunk_number - 1) * chunk_size
 
-    # Prepare the result lists
-    texts_with_labels = []
-    labels_list = []
-    uuids_with_labels = []
-    bert_label_ids_list = []
-
-    for uuid, text in entries_dict.items():
-        if uuid in labels_dict:
-            for label, bert_label_id in zip(labels_dict[uuid], bert_label_ids_dict[uuid]):
-                texts_with_labels.append(text)
-                labels_list.append(label)
-                uuids_with_labels.append(uuid)
-                bert_label_ids_list.append(bert_label_id)
-        else:
-            texts_with_labels.append(text)
-            labels_list.append("")
-            uuids_with_labels.append(uuid)
-            bert_label_ids_list.append(-1)
-
-    # Close the connection
+    select_statement = """
+    SELECT substr(le.text, e.char_start + 1, e.char_end - e.char_start) as text_segment, 
+           e.text_uuid, 
+           COALESCE(l.label, '') as label, 
+           COALESCE(l.bert_id, -1) as bert_label_id, 
+           e.embedding
+    FROM embeddings e
+    INNER JOIN law_entries le ON e.text_uuid = le.uuid
+    LEFT JOIN text_label_link ult ON e.text_uuid = ult.text_uuid AND e.char_start <= ult.char_end AND e.char_end >= ult.char_start
+    LEFT JOIN labels l ON ult.label_uuid = l.label_uuid
+    WHERE e.model_uuid = ?
+    GROUP BY e.uuid, l.label
+    ORDER BY e.uuid
+    LIMIT ? OFFSET ?;
+    """
+    
+    cursor.execute(select_statement, (model_uuid, chunk_size, offset))
+    entries = cursor.fetchall()
     conn.close()
-
-    return texts_with_labels, labels_list, uuids_with_labels, bert_label_ids_list
+    
+    if not entries:
+        return ([], [], [], []), [], total_chunks
+    
+    texts, uuids, labels, bert_label_ids, embeddings_list = zip(*[(entry[0], entry[1], entry[2], entry[3], numpy.frombuffer(entry[4], dtype=numpy.float32) if entry[4] else numpy.array([])) for entry in entries])
+    embeddings = numpy.stack(embeddings_list) if embeddings_list[0].size > 0 else numpy.array([])
+    
+    return (texts, labels, uuids, bert_label_ids, embeddings), total_chunks
 
 def fetch_entries(db_path):
     """
@@ -234,7 +160,7 @@ def fetch_entries_with_embeddings(db_path: str) -> tuple:
     select_statement = """
     SELECT le.text, le.uuid, e.embedding
     FROM law_entries le
-    INNER JOIN embeddings e ON le.uuid = e.law_entry_uuid;
+    INNER JOIN embeddings e ON le.uuid = e.text_uuid;
     """
     
     # Execute the SQL statement
@@ -258,9 +184,231 @@ def fetch_entries_with_embeddings(db_path: str) -> tuple:
     
     return texts, uuids, embeddings
 
-def store_cluster_link_entry(db_path: str, text: str, label_name: str) -> None:
+def fetch_entries_with_embeddings_chunked(db_path: str, chunk_size: int) -> list:
     """
-    Store an entry in the cluster_label_link table by finding the corresponding label_uuid and law_entry_uuid.
+    Fetch all entries from the law_entries table in the database along with their embeddings,
+    and return them in chunks of a specified size.
+
+    Args:
+        db_path (str): The path to the SQLite database.
+        chunk_size (int): The size of each chunk.
+
+    Returns:
+        list: A list of tuples, each tuple containing three lists (texts, uuids, embeddings) for a chunk.
+    """
+    # Connect to the SQLite3 database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # SQL statement to join law_entries and embeddings tables and select texts, uuids, and embeddings
+    select_statement = """
+    SELECT le.text, le.uuid, e.embedding
+    FROM law_entries le
+    INNER JOIN embeddings e ON le.uuid = e.text_uuid;
+    """
+    
+    # Execute the SQL statement
+    cursor.execute(select_statement)
+    
+    # Fetch all rows
+    entries = cursor.fetchall()
+    
+    # Close the connection
+    conn.close()
+    
+    # If there are no entries, return an empty list
+    if not entries:
+        return []
+    
+    # Unpack texts, uuids, and embeddings into separate lists
+    texts, uuids, embeddings_list = zip(*[(entry[0], entry[1], numpy.frombuffer(entry[2], dtype=numpy.float32)) for entry in entries])
+    
+    # Initialize lists to hold chunks
+    chunked_texts = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+    chunked_uuids = [uuids[i:i + chunk_size] for i in range(0, len(uuids), chunk_size)]
+    chunked_embeddings = [embeddings_list[i:i + chunk_size] for i in range(0, len(embeddings_list), chunk_size)]
+    
+    # Convert list of embeddings in each chunk to a single NumPy array
+    chunked_embeddings = [numpy.stack(chunk) for chunk in chunked_embeddings]
+    
+    # Zip the chunked lists together to form tuples for each chunk
+    chunked_entries = list(zip(chunked_texts, chunked_uuids, chunked_embeddings))
+    
+    return chunked_entries
+
+def fetch_entries_with_embeddings_specific_chunk(db_path: str, model_uuid: str, chunk_size: int, chunk_number: int) -> tuple:
+    """
+    Fetch a specific chunk of entries from the embeddings table in the database along with their text segments from law_entries,
+    in a memory-efficient manner by only loading the required chunk of data.
+
+    Args:
+        db_path (str): The path to the SQLite database.
+        model_uuid (str): The UUID of the model to match embeddings.
+        chunk_size (int): The size of each chunk.
+        chunk_number (int): The specific chunk number to return.
+
+    Returns:
+        tuple: A tuple containing four lists (text segments, uuids of the law entries, uuids of the embeddings, embeddings) for the specified chunk and the total number of chunks.
+    """
+    # Connect to the SQLite3 database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # First, get the total number of entries in embeddings for the given model_uuid to calculate the total number of chunks
+    cursor.execute("SELECT COUNT(*) FROM embeddings WHERE model_uuid = ?", (model_uuid,))
+    total_entries = cursor.fetchone()[0]
+    total_chunks = (total_entries + chunk_size - 1) // chunk_size
+    
+    # Check if the requested chunk number is within the range of available chunks
+    if chunk_number < 1 or chunk_number > total_chunks:
+        conn.close()
+        raise ValueError(f"Requested chunk number {chunk_number} is out of range. Total available chunks: {total_chunks}.")
+
+    # Calculate the offset for the SQL query
+    offset = (chunk_number - 1) * chunk_size
+
+    # Modify the SQL query to fetch only the specific chunk of data from embeddings and the corresponding text segment from law_entries
+    select_statement = """
+    SELECT le.text, e.text_uuid, e.uuid, e.char_start, e.char_end, e.embedding
+    FROM embeddings e
+    INNER JOIN law_entries le ON e.text_uuid = le.uuid
+    WHERE e.model_uuid = ?
+    LIMIT ? OFFSET ?;
+    """
+    
+    # Execute the SQL statement with model_uuid, chunk_size, and offset
+    cursor.execute(select_statement, (model_uuid, chunk_size, offset))
+    
+    # Fetch the rows for the specific chunk
+    entries = cursor.fetchall()
+    
+    # Close the connection
+    conn.close()
+    
+    # If there are no entries, return empty lists and 0 as the number of chunks
+    if not entries:
+        return ([], [], [], []), total_chunks
+    
+    # Unpack text segments, uuids, embedding uuids, and embeddings into separate lists
+    text_segments = [entry[0][entry[3]:entry[4]] for entry in entries]  # Extract text segment using char_start and char_end
+    text_uuids = [entry[1] for entry in entries]
+    embedding_uuids = [entry[2] for entry in entries]
+    embeddings_list = [numpy.frombuffer(entry[5], dtype=numpy.float32) for entry in entries]
+    
+    # Convert the list of embeddings to a single NumPy array
+    embeddings = numpy.stack(embeddings_list)
+    
+    return (text_segments, text_uuids, embedding_uuids, embeddings), total_chunks
+
+# def fetch_entries_with_embeddings_specific_chunk(db_path: str, chunk_size: int, chunk_number: int) -> tuple:
+#     """
+#     Fetch a specific chunk of entries from the law_entries table in the database along with their embeddings,
+#     in a memory-efficient manner by only loading the required chunk of data.
+
+#     Args:
+#         db_path (str): The path to the SQLite database.
+#         chunk_size (int): The size of each chunk.
+#         chunk_number (int): The specific chunk number to return.
+
+#     Returns:
+#         tuple: A tuple containing three lists (texts, uuids, embeddings) for the specified chunk and the total number of chunks.
+#     """
+#     # Connect to the SQLite3 database
+#     conn = sqlite3.connect(db_path)
+#     cursor = conn.cursor()
+    
+#     # First, get the total number of entries to calculate the total number of chunks
+#     cursor.execute("SELECT COUNT(*) FROM law_entries")
+#     total_entries = cursor.fetchone()[0]
+#     total_chunks = (total_entries + chunk_size - 1) // chunk_size
+    
+#     # Check if the requested chunk number is within the range of available chunks
+#     if chunk_number < 1 or chunk_number > total_chunks:
+#         print(f"Requested chunk number {chunk_number} is out of range. Total available chunks: {total_chunks}.")
+#         raise ValueError(f"Requested chunk number {chunk_number} is out of range. Total available chunks: {total_chunks}.")
+
+#     # Calculate the offset for the SQL query
+#     offset = (chunk_number - 1) * chunk_size
+
+#     # Modify the SQL query to fetch only the specific chunk of data
+#     select_statement = """
+#     SELECT le.text, le.uuid, e.embedding
+#     FROM law_entries le
+#     INNER JOIN embeddings e ON le.uuid = e.text_uuid
+#     LIMIT ? OFFSET ?;
+#     """
+    
+#     # Execute the SQL statement with chunk_size and offset
+#     cursor.execute(select_statement, (chunk_size, offset))
+    
+#     # Fetch the rows for the specific chunk
+#     entries = cursor.fetchall()
+    
+#     # Close the connection
+#     conn.close()
+    
+#     # If there are no entries, return empty lists and 0 as the number of chunks
+#     if not entries:
+#         return ([], [], []), total_chunks
+    
+#     # Unpack texts, uuids, and embeddings into separate lists
+#     texts, uuids, embeddings_list = zip(*[(entry[0], entry[1], numpy.frombuffer(entry[2], dtype=numpy.float32)) for entry in entries])
+    
+#     # Convert the list of embeddings to a single NumPy array
+#     embeddings = numpy.stack(embeddings_list)
+    
+#     return (texts, uuids, embeddings), total_chunks
+
+def store_cluster_link_entries_bulk(db_path: str, entries: list) -> None:
+    """
+    Store multiple entries in the cluster_label_link table using bulk insert.
+    Roll back if any error occurs during the insert.
+
+    Args:
+        db_path (str): The path to the SQLite database.
+        entries (list): A list of tuples containing the label_name, text_uuid, and embedding_uuid for each entry.
+    """
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+
+        # Prepare the bulk insert statement for labels and cluster_label_link
+        insert_label_statement = """
+            INSERT INTO labels (label_uuid, label, creation_time)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(label) DO NOTHING
+        """
+        insert_link_statement = """
+            INSERT INTO cluster_label_link (label_uuid, text_uuid, creation_time)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(label_uuid, text_uuid) DO NOTHING
+        """
+
+        try:
+            # Begin a transaction
+            conn.execute('BEGIN TRANSACTION;')
+
+            # Insert labels and links in bulk
+            label_uuids = {}
+            for label_name, text_uuid in entries:
+                if label_name not in label_uuids:
+                    label_uuid = str(uuid4())
+                    label_uuids[label_name] = label_uuid
+                    cursor.execute(insert_label_statement, (label_uuid, label_name))
+
+                cursor.execute(insert_link_statement, (label_uuids[label_name], text_uuid))
+
+            # Commit the transaction
+            conn.commit()
+        except sqlite3.Error as e:
+            # Roll back any changes if an error occurs
+            conn.rollback()
+            raise e
+
+def store_cluster_link_entry(db_path: str, text: str, label_name: str, text_uuid: str, embedding_uuid: str, verbose: bool = False) -> None:
+    """
+    Store an entry in the cluster_label_link table by finding the corresponding label_uuid and text_uuid.
+    If the label does not exist, it is added to the labels table.
+    Avoid inserting a duplicate entry if a link already exists.
 
     Args:
         db_path (str): The path to the SQLite database.
@@ -270,37 +418,46 @@ def store_cluster_link_entry(db_path: str, text: str, label_name: str) -> None:
     Returns:
         None
     """
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
 
-    try:
-        # Find the label_uuid for the given label_name
+        # Find or create the label_uuid for the given label_name
         cursor.execute("SELECT label_uuid FROM labels WHERE label = ?", (label_name,))
         label_result = cursor.fetchone()
-        if not label_result:
-            raise ValueError(f"No label found with name '{label_name}'.")
 
-        label_uuid = label_result[0]
+        if label_result:
+            label_uuid = label_result[0]
+        else:
+            label_uuid = str(uuid4())
+            cursor.execute("""
+                INSERT INTO labels (label_uuid, label, creation_time)
+                VALUES (?, ?, datetime('now'))
+            """, (label_uuid, label_name))
 
-        # Find the law_entry_uuid for the given text
-        cursor.execute("SELECT uuid FROM law_entries WHERE text = ?", (text,))
-        entry_result = cursor.fetchone()
-        if not entry_result:
-            raise ValueError(f"No law entry found with the given text.")
+        # # Find the text_uuid for the given text
+        # cursor.execute("SELECT uuid FROM law_entries WHERE text = ?", (text,))
+        # entry_result = cursor.fetchone()
 
-        law_entry_uuid = entry_result[0]
+        # if not entry_result:
+        #     raise ValueError(f"No law entry found with the given text.")
 
-        # Insert into cluster_label_link table
+        # text_uuid = entry_result[0]
+
+        # Check if the link already exists
         cursor.execute("""
-            INSERT INTO cluster_label_link (label_uuid, law_entry_uuid, creation_time)
-            VALUES (?, ?, datetime('now'))
-        """, (label_uuid, law_entry_uuid))
+            SELECT * FROM cluster_label_link
+            WHERE label_uuid = ? AND text_uuid = ?
+        """, (label_uuid, text_uuid))
+        link_exists = cursor.fetchone()
 
-        conn.commit()
-    except sqlite3.Error as e:
-        print(f"An error occurred: {e}")
-    finally:
-        conn.close()
+        if not link_exists:
+            # Insert into cluster_label_link table
+            cursor.execute("""
+                INSERT INTO cluster_label_link (label_uuid, text_uuid, creation_time)
+                VALUES (?, ?, datetime('now'))
+            """, (label_uuid, text_uuid))
+        if link_exists and verbose:
+            print(f"label link exists: {text_uuid} --> {label_name}")
 
 def cluster_entries(db_path: str, model_name: str, min_community_size: int = 25, threshold: float = 0.75):
     """
@@ -315,21 +472,21 @@ def cluster_entries(db_path: str, model_name: str, min_community_size: int = 25,
     # Connect to the database and retrieve embeddings
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT law_entry_uuid, embedding FROM embeddings")
+    cursor.execute("SELECT text_uuid, embedding FROM embeddings")
     entries = cursor.fetchall()
     cursor.execute("SELECT model FROM nlp_model WHERE label = ?", (model_name,))
     model_name_row = cursor.fetchone()
     conn.close()
 
     model_name = model_name_row[0]
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device="cpu")
 
     if not model_name_row:
         print(f"No model found with label '{model_name}'.")
         return
         
     # Extract embeddings and convert them to tensors
-    law_entry_uuids = [entry[0] for entry in entries]
+    text_uuids = [entry[0] for entry in entries]
     embeddings = [torch.Tensor(numpy.frombuffer(entry[1], dtype=numpy.float32)) for entry in entries]
     embeddings_tensor = torch.stack(embeddings)
 
@@ -345,7 +502,7 @@ def cluster_entries(db_path: str, model_name: str, min_community_size: int = 25,
     for i, cluster in enumerate(clusters):
         print("\nCluster {}, #{} Elements ".format(i + 1, len(cluster)))
         for entry_id in cluster:
-            print("\tUUID: ", law_entry_uuids[entry_id])
+            print("\tUUID: ", text_uuids[entry_id])
     
     return
 
@@ -370,13 +527,16 @@ def insert_user_label_text(db_path: str, label_name: str, text_uuid: str, char_s
     if label_result:
         label_uuid = label_result[0]
     else:
-        # If the label does not exist or is not a user label, create a new user label
+        # If the label does not exist or is not a user label, create a new user label with the current datetime
         label_uuid = str(uuid4())
-        cursor.execute("INSERT INTO labels (label_uuid, label, is_user_label) VALUES (?, ?, 1)", (label_uuid, label_name))
+        cursor.execute("""
+            INSERT INTO labels (label_uuid, label, is_user_label, creation_time)
+            VALUES (?, ?, 1, datetime('now'))
+        """, (label_uuid, label_name))
     
-    # Insert the new label text into user_label_texts table
+    # Insert the new label text into text_label_link table
     cursor.execute("""
-        INSERT INTO user_label_texts (label_uuid, text_uuid, creation_time, char_start, char_end)
+        INSERT INTO text_label_link (label_uuid, text_uuid, creation_time, char_start, char_end)
         VALUES (?, ?, datetime('now'), ?, ?)
     """, (label_uuid, text_uuid, char_start, char_end))
 
@@ -385,24 +545,35 @@ def insert_user_label_text(db_path: str, label_name: str, text_uuid: str, char_s
 
 def insert_label(db_path, label_text, color='blue'):
     """
-    Insert a new label into the labels table.
+    Insert a new label into the labels table if it doesn't already exist.
 
     Args:
-        conn: The database connection object.
+        db_path (str): The path to the SQLite database.
         label_text (str): The text of the label to insert.
         color (str, optional): The color associated with the label.
 
     Returns:
-        str: The UUID of the inserted label.
+        str: The UUID of the inserted or existing label.
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    label_uuid = str(uuid4())
-    cursor.execute("""
-        INSERT INTO labels (label_uuid, label, creation_time, color)
-        VALUES (?, ?, datetime('now'), ?)
-    """, (label_uuid, label_text, color))
-    conn.commit()
+
+    # Check if the label already exists
+    cursor.execute("SELECT label_uuid FROM labels WHERE label = ?", (label_text,))
+    existing_label = cursor.fetchone()
+
+    if existing_label:
+        label_uuid = existing_label[0]  # Use the existing label's UUID
+    else:
+        # If the label does not exist, insert a new one
+        label_uuid = str(uuid4())
+        cursor.execute("""
+            INSERT INTO labels (label_uuid, label, creation_time, color)
+            VALUES (?, ?, datetime('now'), ?)
+        """, (label_uuid, label_text, color))
+        conn.commit()
+
+    conn.close()
     return label_uuid
 
 def list_labels(db_path):
@@ -417,7 +588,7 @@ def list_labels(db_path):
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT label_uuid, label, creation_time, color FROM labels")
+    cursor.execute("SELECT label_uuid, label, creation_time, color FROM labels WHERE is_user_label = 1")
     return cursor.fetchall()
 
 def fetch_law_entries(conn, chunking_method, chunking_size, batch_size=1000):
@@ -433,27 +604,27 @@ def fetch_law_entries(conn, chunking_method, chunking_size, batch_size=1000):
             break
         chunked_entries = []
         for entry in entries:
-            law_entry_uuid, text = entry
+            text_uuid, text = entry
             char_start = 0
             if chunking_method == 'sentence':
                 sentences = sent_tokenize(text)
                 for i in range(0, len(sentences), chunking_size):
                     chunk = ' '.join(sentences[i:i+chunking_size])
                     char_end = char_start + len(chunk)
-                    chunked_entries.append((law_entry_uuid, chunk, char_start, char_end))
+                    chunked_entries.append((text_uuid, chunk, char_start, char_end))
                     char_start = char_end + 1  # +1 for the space after each chunk
             elif chunking_method == 'word':
                 words = text.split()
                 for i in range(0, len(words), chunking_size):
                     chunk = ' '.join(words[i:i+chunking_size])
                     char_end = char_start + len(chunk)
-                    chunked_entries.append((law_entry_uuid, chunk, char_start, char_end))
+                    chunked_entries.append((text_uuid, chunk, char_start, char_end))
                     char_start = char_end + 1  # +1 for the space after each chunk
             elif chunking_method == 'char':
                 for i in range(0, len(text), chunking_size):
                     chunk = text[i:i+chunking_size]
                     char_end = char_start + len(chunk)
-                    chunked_entries.append((law_entry_uuid, chunk, char_start, char_end))
+                    chunked_entries.append((text_uuid, chunk, char_start, char_end))
                     char_start = char_end
         yield chunked_entries
 
@@ -461,7 +632,7 @@ def compute_embeddings(model_name, texts):
     """
     Pure function to compute embeddings for a list of texts using the specified model.
     """
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device="cpu")
     embeddings = model.encode(texts, convert_to_tensor=False)
     return embeddings
 
@@ -470,22 +641,22 @@ def store_embeddings(conn, model_uuid, entries_with_positions):
     Function to store embeddings in the database along with their character start and end positions.
     """
     cursor = conn.cursor()
-    for law_entry_uuid, char_start, char_end, embedding in entries_with_positions:
+    for text_uuid, char_start, char_end, embedding in entries_with_positions:
         cursor.execute("""
-            INSERT INTO embeddings (model_uuid, law_entry_uuid, creation_time, char_start, char_end, embedding)
+            INSERT INTO embeddings (model_uuid, text_uuid, creation_time, char_start, char_end, embedding)
             VALUES (?, ?, datetime('now'), ?, ?, ?)
-        """, (model_uuid, law_entry_uuid, char_start, char_end, embedding.tobytes()))
+        """, (model_uuid, text_uuid, char_start, char_end, embedding.tobytes()))
 
 def process_batch(model_name, model_uuid, batch, db_path):
     """
     Function to process a batch of entries, compute embeddings, and store them in the database.
     """
     # Unpack the batch to separate the texts and their corresponding char positions
-    law_entry_uuids, texts, char_starts, char_ends = zip(*batch)
+    text_uuids, texts, char_starts, char_ends = zip(*batch)
     embeddings = compute_embeddings(model_name, texts)
     conn = sqlite3.connect(db_path)
     # Combine the entries and their char positions with the computed embeddings
-    entries_with_positions = zip(law_entry_uuids, char_starts, char_ends, embeddings)
+    entries_with_positions = zip(text_uuids, char_starts, char_ends, embeddings)
     store_embeddings(conn, model_uuid, entries_with_positions)
     conn.commit()
     conn.close()
@@ -527,23 +698,24 @@ def compute_query_embedding(model_name: str, query: str) -> torch.Tensor:
     """
     Compute the embedding for a query using the specified model.
     """
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device="cpu")
     query_embedding = model.encode(query, convert_to_tensor=True)
     return query_embedding
 
-def search_embeddings(conn, query_embedding: torch.Tensor, top_k: int = 5, label: str = None):
+def search_embeddings_by_similarity(conn, query_embedding: torch.Tensor, similarity_threshold: float = 0.75, label: str = None):
     """
-    Search the embeddings table for the top-k most similar entries to the query embedding.
+    Search the embeddings table for entries that are more similar to the query embedding than the specified threshold.
     Optionally filter the search to only include entries linked to a specific label.
 
     Args:
         conn: The database connection object.
         query_embedding (torch.Tensor): The query embedding tensor.
-        top_k (int, optional): The number of top similar entries to return. Defaults to 5.
+        similarity_threshold (float, optional): The similarity threshold to filter entries. Defaults to 0.75.
         label (str, optional): The label to filter the search by. Defaults to None.
 
     Returns:
-        list: A list of tuples containing the law entry UUIDs and their corresponding similarity scores.
+        list: A list of tuples containing the law entry UUIDs and their corresponding similarity scores above the threshold,
+              sorted by similarity score in descending order.
     """
     cursor = conn.cursor()
     # If a label is provided, first find the corresponding label_uuid
@@ -560,32 +732,118 @@ def search_embeddings(conn, query_embedding: torch.Tensor, top_k: int = 5, label
     # Modify the query based on whether a label_uuid has been found
     if label_uuid:
         cursor.execute("""
-            SELECT e.law_entry_uuid, e.embedding, e.char_start, e.char_end
+            SELECT e.text_uuid, e.embedding, e.char_start, e.char_end
             FROM embeddings e
-            INNER JOIN cluster_label_link cll ON e.law_entry_uuid = cll.law_entry_uuid
+            INNER JOIN cluster_label_link cll ON e.text_uuid = cll.text_uuid
             WHERE cll.label_uuid = ?
         """, (label_uuid,))
     else:
-        cursor.execute("SELECT law_entry_uuid, embedding, char_start, char_end FROM embeddings")
+        cursor.execute("SELECT text_uuid, embedding, char_start, char_end FROM embeddings")
 
     corpus_embeddings = []
-    law_entry_uuids = []
+    text_uuids = []
     char_starts = []
     char_ends = []
-    for law_entry_uuid, embedding_blob, char_start, char_end in cursor.fetchall():
+    for text_uuid, embedding_blob, char_start, char_end in cursor.fetchall():
         embedding = torch.Tensor(numpy.frombuffer(embedding_blob, dtype=numpy.float32))
         corpus_embeddings.append(embedding)
-        law_entry_uuids.append(law_entry_uuid)
+        text_uuids.append(text_uuid)
         char_starts.append(char_start)
         char_ends.append(char_end)
 
     corpus_embeddings_tensor = torch.stack(corpus_embeddings)
     cos_scores = util.cos_sim(query_embedding, corpus_embeddings_tensor)[0]
-    top_results = torch.topk(cos_scores, k=top_k)
+
+    # Filter results by similarity threshold and sort by score
+    similar_entries = [(text_uuids[idx], score.item(), char_starts[idx], char_ends[idx])
+                       for idx, score in enumerate(cos_scores) if score.item() >= similarity_threshold]
+    similar_entries.sort(key=lambda x: x[1], reverse=True)  # Sort by similarity score in descending order
+
+    return similar_entries
+
+def search_embeddings(conn, query_embedding: torch.Tensor, model_name: str, top_k: int = 5, included_labels: list = None, excluded_labels: list = None):
+    """
+    Search the embeddings table for the top-k most similar entries to the query embedding.
+    Optionally filter the search to only include entries linked to specific labels and exclude certain labels.
+
+    Args:
+        conn: The database connection object.
+        query_embedding (torch.Tensor): The query embedding tensor.
+        top_k (int, optional): The number of top similar entries to return. Defaults to 5.
+        included_labels (list, optional): List of label_uuids to include in the search.
+        excluded_labels (list, optional): List of label_uuids to exclude from the search.
+
+    Returns:
+        list: A list of tuples containing the law entry UUIDs and their corresponding similarity scores.
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT uuid FROM nlp_model WHERE model = ?", (model_name,))
+    model_row = cursor.fetchone()
+    if not model_row:
+        print(f"No model found with name '{model_name}'.")
+        return []
+    model_uuid = model_row[0]
+
+    # Build the SQL query dynamically based on included and excluded labels
+    include_condition = ""
+    exclude_condition = ""
+    params = []
+
+    if included_labels:
+        placeholders = ','.join('?' for _ in included_labels)
+        include_condition = f"INNER JOIN text_label_link tll_included ON e.text_uuid = tll_included.text_uuid AND tll_included.label_uuid IN ({placeholders})"
+        params.extend(included_labels)
+
+    if excluded_labels:
+        placeholders = ','.join('?' for _ in excluded_labels)
+        exclude_condition = f"LEFT JOIN text_label_link tll_excluded ON e.text_uuid = tll_excluded.text_uuid AND tll_excluded.label_uuid IN ({placeholders})"
+        params.extend(excluded_labels)
+
+    params.append(model_uuid)
+
+    # Prepare the SQL query
+    query = f"""
+        SELECT e.text_uuid, e.embedding, e.char_start, e.char_end
+        FROM embeddings e
+        {include_condition}
+        {exclude_condition}
+        WHERE e.model_uuid = ?  -- Filter by model_uuid
+    """
+
+    where_clauses = []
+    if excluded_labels:
+        where_clauses.append(f"tll_excluded.label_uuid IS NULL")
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+
+    if included_labels:
+        query += " GROUP BY e.text_uuid HAVING COUNT(DISTINCT tll_included.label_uuid) = ?"
+        params.append(len(included_labels))
+
+    # Execute the SQL query
+    cursor.execute(query, params)
+
+    corpus_embeddings = []
+    text_uuids = []
+    char_starts = []
+    char_ends = []
+    for text_uuid, embedding_blob, char_start, char_end in cursor.fetchall():
+        embedding = torch.Tensor(numpy.frombuffer(embedding_blob, dtype=numpy.float32))
+        corpus_embeddings.append(embedding)
+        text_uuids.append(text_uuid)
+        char_starts.append(char_start)
+        char_ends.append(char_end)
+
+    if not corpus_embeddings:
+        return []
+
+    corpus_embeddings_tensor = torch.stack(corpus_embeddings)
+    cos_scores = util.cos_sim(query_embedding, corpus_embeddings_tensor)[0]
+    top_results = torch.topk(cos_scores, k=min(top_k, len(corpus_embeddings)))
 
     similar_entries = []
     for score, idx in zip(top_results[0], top_results[1]):
-        similar_entries.append((law_entry_uuids[idx], score.item(), char_starts[idx], char_ends[idx]))
+        similar_entries.append((text_uuids[idx], score.item(), char_starts[idx], char_ends[idx]))
 
     return similar_entries
 
@@ -600,14 +858,14 @@ def print_similar_entries(db_path: str, similar_entries):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     try:
-        for law_entry_uuid, score, char_start, char_end in similar_entries:
-            cursor.execute("SELECT text FROM law_entries WHERE uuid = ?", (law_entry_uuid,))
+        for text_uuid, score, char_start, char_end in similar_entries:
+            cursor.execute("SELECT text FROM law_entries WHERE uuid = ?", (text_uuid,))
             text = cursor.fetchone()[0]
             print(f"{text} (Score: {score:.4f}, Start: {char_start}, End: {char_end})")
     finally:
         conn.close()
 
-def perform_search(db_path: str, model_name: str, query: str, top_k: int = 5, label: str = None) -> list:
+def perform_search_by_similarity(db_path: str, model_name: str, query: str, percent: int = 50, label: str = None) -> list:
     """
     Perform a search over the embeddings table using cosine similarity and return the similar entries.
 
@@ -621,8 +879,33 @@ def perform_search(db_path: str, model_name: str, query: str, top_k: int = 5, la
         list: A list of tuples containing the law entry UUIDs and their corresponding similarity scores.
     """
     conn = sqlite3.connect(db_path)
+    scaled_percent = percent / 100.00
     query_embedding = compute_query_embedding(model_name, query)
-    similar_entries = search_embeddings(conn, query_embedding, top_k, label)
+    similar_entries = search_embeddings_by_similarity(conn, query_embedding, scaled_percent, label)
+    print(similar_entries)
+    conn.close()
+    return similar_entries
+
+def perform_search(db_path: str, model_name: str, query: str, top_k: int = 5, included_labels: list = None, excluded_labels: list = None) -> list:
+    """
+    Perform a search over the embeddings table using cosine similarity and return the similar entries.
+
+    Args:
+        db_path (str): The path to the SQLite database.
+        model_name (str): The name of the model to use for computing the query embedding.
+        query (str): The query string to search for.
+        top_k (int): The number of top similar entries to return.
+        included_labels (list): List of label_uuids to include in the search.
+        excluded_labels (list): List of label_uuids to exclude from the search.
+
+    Returns:
+        list: A list of tuples containing the law entry UUIDs and their corresponding similarity scores.
+    """
+    conn = sqlite3.connect(db_path)
+    query_embedding = compute_query_embedding(model_name, query)
+    
+    # Modify the search function to filter by included and excluded labels
+    similar_entries = search_embeddings(conn, query_embedding, model_name, top_k, included_labels, excluded_labels)
     conn.close()
     return similar_entries
 
@@ -640,26 +923,26 @@ def list_models(db_path):
     conn.close()
     return models
 
-def process_topics(db_path: str):
-    # Step 1: Fetch entries from the database
-    texts, uuids = fetch_entries(db_path)
+# def process_topics(db_path: str):
+#     # Step 1: Fetch entries from the database
+#     texts, uuids = fetch_entries(db_path)
 
-    # Step 2: Create a BERTopic model and fit it to the texts
-    topic_model = BERTopic()
-    topics, probs = topic_model.fit_transform(texts)
+#     # Step 2: Create a BERTopic model and fit it to the texts
+#     topic_model = BERTopic()
+#     topics, probs = topic_model.fit_transform(texts)
 
-    # Step 3: Insert the topic labels into the database
-    topic_info = topic_model.get_topic_info()
-    topic_names = topic_info['Name'].tolist()
-    for topic_name in topic_names:
-        insert_label(db_path, topic_name)
+#     # Step 3: Insert the topic labels into the database
+#     topic_info = topic_model.get_topic_info()
+#     topic_names = topic_info['Name'].tolist()
+#     for topic_name in topic_names:
+#         insert_label(db_path, topic_name)
 
-    # Step 4: Store the cluster link entries in the database
-    document_info = topic_model.get_document_info(texts)
-    documents = document_info['Document'].tolist()
-    names = document_info['Name'].tolist()
-    for doc, name in zip(documents, names):
-        store_cluster_link_entry(db_path, doc, name)
+#     # Step 4: Store the cluster link entries in the database
+#     document_info = topic_model.get_document_info(texts)
+#     documents = document_info['Document'].tolist()
+#     names = document_info['Name'].tolist()
+#     for doc, name in zip(documents, names):
+#         store_cluster_link_entry(db_path, doc, name)
 
     # # Optional: Use HDBSCAN for clustering with BERTopic
     # hdbscan_model = HDBSCAN(min_cluster_size=15, metric='euclidean', cluster_selection_method='eom', prediction_data=True)
@@ -669,26 +952,26 @@ def process_topics(db_path: str):
     # # Return the topic model information
     # return topic_model_cluster.get_topic_info()
 
-def process_topics_with_user_labels(db_path: str):
-    # Step 1: Fetch entries from the database
-    texts, labels, uuids = fetch_entries_with_user_labels(db_path)
+# def process_topics_with_user_labels(db_path: str):
+#     # Step 1: Fetch entries from the database
+#     texts, labels, uuids = fetch_entries_with_user_labels(db_path)
 
-    # Step 2: Create a BERTopic model and fit it to the texts
-    topic_model = BERTopic()
-    topics, probs = topic_model.fit_transform(texts, y=labels)
+#     # Step 2: Create a BERTopic model and fit it to the texts
+#     topic_model = BERTopic()
+#     topics, probs = topic_model.fit_transform(texts, y=labels)
 
-    # Step 3: Insert the topic labels into the database
-    topic_info = topic_model.get_topic_info()
-    topic_names = topic_info['Name'].tolist()
-    for topic_name in topic_names:
-        insert_label(db_path, topic_name)
+#     # Step 3: Insert the topic labels into the database
+#     topic_info = topic_model.get_topic_info()
+#     topic_names = topic_info['Name'].tolist()
+#     for topic_name in topic_names:
+#         insert_label(db_path, topic_name)
 
-    # Step 4: Store the cluster link entries in the database
-    document_info = topic_model.get_document_info(texts)
-    documents = document_info['Document'].tolist()
-    names = document_info['Name'].tolist()
-    for doc, name in zip(documents, names):
-        store_cluster_link_entry(db_path, doc, name)
+#     # Step 4: Store the cluster link entries in the database
+#     document_info = topic_model.get_document_info(texts)
+#     documents = document_info['Document'].tolist()
+#     names = document_info['Name'].tolist()
+#     for doc, name in zip(documents, names):
+#         store_cluster_link_entry(db_path, doc, name)
 
     # # Optional: Use HDBSCAN for clustering with BERTopic
     # hdbscan_model = HDBSCAN(min_cluster_size=15, metric='euclidean', cluster_selection_method='eom', prediction_data=True)
@@ -755,7 +1038,7 @@ if __name__ == "__main__":
     db_name = 'law_database.db'
 
     if args.command == 'create':
-        setup_database(db_name)
+        create_database(db_name)
         # Validate chunking size if provided
         if args.chunk_size is not None and args.chunk_size <= 0:
             parser.error("Chunking size must be a non-zero integer")
@@ -766,7 +1049,7 @@ if __name__ == "__main__":
         print_similar_entries(db_name, similar_entries)
     
     elif args.command == 'init-db':
-        setup_database(args.db_name)
+        create_database(args.db_name)
         print(f"Database '{args.db_name}' initialized successfully.")
     
     elif args.command == 'create-label':
